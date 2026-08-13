@@ -39,6 +39,7 @@
 
 #include <linux/kvm.h>
 #include <linux/kvm_para.h>
+#include <linux/nitro_main.h>
 
 #include <linux/kvm_types.h>
 
@@ -345,6 +346,7 @@ struct kvm_vcpu {
 
 	struct mutex mutex;
 	struct kvm_run *run;
+	struct nitro_vcpu nitro;
 
 #ifndef __KVM_HAVE_ARCH_WQP
 	struct rcuwait wait;
@@ -848,6 +850,7 @@ struct kvm {
 	struct kvm_stat_data **debugfs_stat_data;
 	struct srcu_struct srcu;
 	struct srcu_struct irq_srcu;
+	struct nitro nitro;
 	pid_t userspace_pid;
 	bool override_halt_poll_ns;
 	unsigned int max_halt_poll_ns;
@@ -1017,6 +1020,7 @@ void kvm_destroy_vcpus(struct kvm *kvm);
 
 void vcpu_load(struct kvm_vcpu *vcpu);
 void vcpu_put(struct kvm_vcpu *vcpu);
+int create_vcpu_fd(struct kvm_vcpu *vcpu);
 
 #ifdef __KVM_HAVE_IOAPIC
 void kvm_arch_post_irq_ack_notifier_list_update(struct kvm *kvm);

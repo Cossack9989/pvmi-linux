@@ -13,6 +13,7 @@
 
 #include <linux/module.h>
 #include <linux/entry-kvm.h>
+#include <linux/nitro_main.h>
 
 #include <asm/gsseg.h>
 #include <asm/io_bitmap.h>
@@ -1710,6 +1711,8 @@ static int handle_synthetic_instruction_return_user(struct kvm_vcpu *vcpu)
 	if (pending_async_exceptions & PVM_PVCS_EVENT_VECTOR_NMI)
 		do_pvm_event(vcpu, NMI_VECTOR, false, 0);
 
+	nitro_report_syscall_exit(vcpu);
+
 	return 1;
 }
 
@@ -1968,8 +1971,10 @@ static int handle_exit_syscall(struct kvm_vcpu *vcpu)
 	unsigned long rip = kvm_rip_read(vcpu);
 	unsigned long a0, a1, a2;
 
-	if (!is_smod(pvm))
+	if (!is_smod(pvm)) {
+		nitro_report_syscall_enter(vcpu);
 		return __do_pvm_event(vcpu, true, PVM_SYSCALL_VECTOR, false, 0);
+	}
 
 	if (rip == pvm->msr_retu_rip_plus2)
 		return handle_synthetic_instruction_return_user(vcpu);

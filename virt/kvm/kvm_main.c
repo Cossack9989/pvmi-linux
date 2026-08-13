@@ -22,6 +22,7 @@
 #include <linux/vmalloc.h>
 #include <linux/reboot.h>
 #include <linux/debugfs.h>
+#include <linux/fdtable.h>
 #include <linux/highmem.h>
 #include <linux/file.h>
 #include <linux/syscore_ops.h>
@@ -49,6 +50,7 @@
 #include <linux/lockdep.h>
 #include <linux/kthread.h>
 #include <linux/suspend.h>
+#include <linux/nitro_main.h>
 
 #include <asm/processor.h>
 #include <asm/ioctl.h>
@@ -501,10 +503,13 @@ static void kvm_vcpu_init(struct kvm_vcpu *vcpu, struct kvm *kvm, unsigned id)
 	/* Fill the stats id string for the vcpu */
 	snprintf(vcpu->stats_id, sizeof(vcpu->stats_id), "kvm-%d/vcpu-%d",
 		 task_pid_nr(current), id);
+
+	nitro_create_vcpu_hook(vcpu);
 }
 
 static void kvm_vcpu_destroy(struct kvm_vcpu *vcpu)
 {
+	nitro_destroy_vcpu_hook(vcpu);
 	kvm_arch_vcpu_destroy(vcpu);
 	kvm_dirty_ring_free(&vcpu->dirty_ring);
 
@@ -1173,6 +1178,7 @@ static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
 
 	INIT_LIST_HEAD(&kvm->devices);
 	kvm->max_vcpus = KVM_MAX_VCPUS;
+	nitro_create_vm_hook(kvm);
 
 	BUILD_BUG_ON(KVM_MEM_SLOTS_NUM > SHRT_MAX);
 
@@ -1313,6 +1319,7 @@ static void kvm_destroy_vm(struct kvm *kvm)
 	int i;
 	struct mm_struct *mm = kvm->mm;
 
+	nitro_destroy_vm_hook(kvm);
 	kvm_destroy_pm_notifier(kvm);
 	kvm_uevent_notify_change(KVM_EVENT_DESTROY_VM, kvm);
 	kvm_destroy_vm_debugfs(kvm);
@@ -4170,7 +4177,7 @@ static struct file_operations kvm_vcpu_fops = {
 /*
  * Allocates an inode for the vcpu.
  */
-static int create_vcpu_fd(struct kvm_vcpu *vcpu)
+int create_vcpu_fd(struct kvm_vcpu *vcpu)
 {
 	char name[8 + 1 + ITOA_MAX_LEN + 1];
 
@@ -4449,11 +4456,15 @@ static long kvm_vcpu_ioctl(struct file *filp,
 	struct kvm_fpu *fpu = NULL;
 	struct kvm_sregs *kvm_sregs = NULL;
 
-	if (vcpu->kvm->mm != current->mm || vcpu->kvm->vm_dead)
-		return -EIO;
-
 	if (unlikely(_IOC_TYPE(ioctl) != KVMIO))
 		return -EINVAL;
+
+	r = nitro_vcpu_ioctl(vcpu, ioctl, arg);
+	if (r != -ENOIOCTLCMD)
+		return r;
+
+	if (vcpu->kvm->mm != current->mm || vcpu->kvm->vm_dead)
+		return -EIO;
 
 	/*
 	 * Some architectures have vcpu ioctls that are asynchronous to vcpu
@@ -5162,8 +5173,34 @@ static long kvm_vm_ioctl(struct file *filp,
 	void __user *argp = (void __user *)arg;
 	int r;
 
-	if (kvm->mm != current->mm || kvm->vm_dead)
-		return -EIO;
+	switch (ioctl) {
+	case KVM_NITRO_ATTACH_VCPUS: {
+		struct nitro_vcpus nvcpus;
+
+		r = nitro_ioctl_attach_vcpus(kvm, &nvcpus);
+		if (r)
+			return r;
+		if (copy_to_user(argp, &nvcpus, sizeof(nvcpus))) {
+			int i;
+
+			for (i = 0; i < nvcpus.num_vcpus; i++)
+				close_fd(nvcpus.fds[i]);
+			r = -EFAULT;
+		}
+		return r;
+	}
+	case KVM_NITRO_SET_SYSCALL_TRAP: {
+		u8 enabled;
+
+		if (copy_from_user(&enabled, argp, sizeof(enabled)))
+			return -EFAULT;
+		return nitro_ioctl_set_syscall_trap(kvm, enabled);
+	}
+	default:
+		if (kvm->mm != current->mm || kvm->vm_dead)
+			return -EIO;
+	}
+
 	switch (ioctl) {
 	case KVM_CREATE_VCPU:
 		r = kvm_vm_ioctl_create_vcpu(kvm, arg);
@@ -5533,6 +5570,7 @@ put_fd:
 static long kvm_dev_ioctl(struct file *filp,
 			  unsigned int ioctl, unsigned long arg)
 {
+	void __user *argp = (void __user *)arg;
 	int r = -EINVAL;
 
 	switch (ioctl) {
@@ -5547,6 +5585,29 @@ static long kvm_dev_ioctl(struct file *filp,
 	case KVM_CHECK_EXTENSION:
 		r = kvm_vm_ioctl_check_extension_generic(NULL, arg);
 		break;
+	case KVM_NITRO_NUM_VMS:
+		r = nitro_ioctl_num_vms();
+		break;
+	case KVM_NITRO_ATTACH_VM: {
+		pid_t creator;
+		struct kvm *kvm;
+
+		if (copy_from_user(&creator, argp, sizeof(creator))) {
+			r = -EFAULT;
+			break;
+		}
+
+		kvm = nitro_get_vm_by_creator(creator);
+		if (!kvm) {
+			r = -ESRCH;
+			break;
+		}
+
+		r = anon_inode_getfd("kvm-vm", &kvm_vm_fops, kvm, O_RDWR | O_CLOEXEC);
+		if (r < 0)
+			kvm_put_kvm(kvm);
+		break;
+	}
 	case KVM_GET_VCPU_MMAP_SIZE:
 		if (arg)
 			goto out;

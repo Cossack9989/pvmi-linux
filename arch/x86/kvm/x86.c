@@ -11775,6 +11775,16 @@ int kvm_arch_vcpu_ioctl_get_sregs(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
+void kvm_arch_vcpu_nitro_get_event(struct kvm_vcpu *vcpu, struct event *event)
+{
+	if (vcpu->kvm->arch.has_protected_state &&
+	    vcpu->arch.guest_state_protected)
+		return;
+
+	__get_regs(vcpu, &event->regs);
+	__get_sregs(vcpu, &event->sregs);
+}
+
 int kvm_arch_vcpu_ioctl_get_mpstate(struct kvm_vcpu *vcpu,
 				    struct kvm_mp_state *mp_state)
 {
@@ -12054,6 +12064,26 @@ int kvm_arch_vcpu_ioctl_set_sregs(struct kvm_vcpu *vcpu,
 	ret = __set_sregs(vcpu, sregs);
 	vcpu_put(vcpu);
 	return ret;
+}
+
+int kvm_arch_vcpu_nitro_set_event(struct kvm_vcpu *vcpu, struct event *event,
+				  bool regs_dirty, bool sregs_dirty)
+{
+	int r = 0;
+
+	if (vcpu->kvm->arch.has_protected_state &&
+	    vcpu->arch.guest_state_protected)
+		return -EINVAL;
+
+	if (sregs_dirty) {
+		r = __set_sregs(vcpu, &event->sregs);
+		if (r)
+			return r;
+	}
+	if (regs_dirty)
+		__set_regs(vcpu, &event->regs);
+
+	return 0;
 }
 
 static void kvm_arch_vcpu_guestdbg_update_apicv_inhibit(struct kvm *kvm)

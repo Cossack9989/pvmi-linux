@@ -137,7 +137,7 @@ SYM_INNER_LABEL(entry_SYSCALL_64_switcher_safe_stack, SYM_L_GLOBAL)
 	pushq	%rdi					/* put rdi on ORIG_RAX */
 
 	/* check if it can do direct switch from umod to smod */
-	testq	$SWITCH_FLAGS_NO_DS_TO_SMOD, TSS_extra(switch_flags)
+	testq	$SWITCH_FLAGS_NO_DS_TO_SMOD_NITRO, TSS_extra(switch_flags)
 	jnz	.L_switcher_check_return_umod_instruction
 
 	/* Now it must be umod, start to do direct switch from umod to smod */

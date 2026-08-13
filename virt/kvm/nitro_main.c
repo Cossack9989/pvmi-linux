@@ -7,6 +7,7 @@
 #include <linux/kvm_host.h>
 #include <linux/nitro_main.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/uaccess.h>
 
 extern int create_vcpu_fd(struct kvm_vcpu *vcpu);
@@ -63,32 +64,32 @@ void nitro_destroy_vm_hook(struct kvm *kvm)
 
 void nitro_create_vcpu_hook(struct kvm_vcpu *vcpu)
 {
-	mutex_init(&vcpu->nitro.lock);
-	init_completion(&vcpu->nitro.continue_completion);
 	sema_init(&vcpu->nitro.event_sem, 0);
-	memset(&vcpu->nitro.event, 0, sizeof(vcpu->nitro.event));
-	memset(&vcpu->nitro.pending_syscall, 0, sizeof(vcpu->nitro.pending_syscall));
-	vcpu->nitro.regs_dirty = false;
-	vcpu->nitro.sregs_dirty = false;
-	vcpu->nitro.syscall_pending = false;
-	vcpu->nitro.waiting_for_continue = false;
+	spin_lock_init(&vcpu->nitro.event_lock);
+	vcpu->nitro.events = kcalloc(NITRO_EVENT_RING_SIZE,
+				     sizeof(*vcpu->nitro.events),
+				     GFP_KERNEL_ACCOUNT);
+	vcpu->nitro.event_head = 0;
+	vcpu->nitro.event_tail = 0;
+	vcpu->nitro.events_dropped = 0;
 	vcpu->nitro.destroyed = false;
 }
 
 void nitro_destroy_vcpu_hook(struct kvm_vcpu *vcpu)
 {
-	mutex_lock(&vcpu->nitro.lock);
-	vcpu->nitro.destroyed = true;
-	vcpu->nitro.event.present = 0;
-	vcpu->nitro.pending_syscall.present = 0;
-	vcpu->nitro.regs_dirty = false;
-	vcpu->nitro.sregs_dirty = false;
-	vcpu->nitro.syscall_pending = false;
-	vcpu->nitro.waiting_for_continue = false;
-	mutex_unlock(&vcpu->nitro.lock);
+	struct event *events;
+	unsigned long flags;
 
+	spin_lock_irqsave(&vcpu->nitro.event_lock, flags);
+	vcpu->nitro.destroyed = true;
+	vcpu->nitro.event_head = 0;
+	vcpu->nitro.event_tail = 0;
+	events = vcpu->nitro.events;
+	vcpu->nitro.events = NULL;
+	spin_unlock_irqrestore(&vcpu->nitro.event_lock, flags);
+
+	kfree(events);
 	up(&vcpu->nitro.event_sem);
-	complete_all(&vcpu->nitro.continue_completion);
 }
 
 int nitro_ioctl_num_vms(void)
@@ -151,40 +152,44 @@ bool nitro_is_trap_set(struct kvm *kvm, u32 trap)
 	return READ_ONCE(kvm->nitro.traps) & trap;
 }
 
+static void nitro_reset_event_ring(struct kvm_vcpu *vcpu)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&vcpu->nitro.event_lock, flags);
+	vcpu->nitro.event_head = 0;
+	vcpu->nitro.event_tail = 0;
+	spin_unlock_irqrestore(&vcpu->nitro.event_lock, flags);
+
+	while (!down_trylock(&vcpu->nitro.event_sem))
+		;
+}
+
 int nitro_ioctl_set_syscall_trap(struct kvm *kvm, bool enabled)
 {
 	struct kvm_vcpu *vcpu;
 	unsigned long i;
 
-	if (enabled)
-		WRITE_ONCE(kvm->nitro.traps, READ_ONCE(kvm->nitro.traps) | NITRO_TRAP_SYSCALL);
-	else
+	if (!enabled)
 		WRITE_ONCE(kvm->nitro.traps, READ_ONCE(kvm->nitro.traps) & ~NITRO_TRAP_SYSCALL);
 
 	kvm_for_each_vcpu(i, vcpu, kvm) {
-		mutex_lock(&vcpu->nitro.lock);
-		vcpu->nitro.event.present = 0;
-		vcpu->nitro.pending_syscall.present = 0;
-		vcpu->nitro.regs_dirty = false;
-		vcpu->nitro.sregs_dirty = false;
-		vcpu->nitro.syscall_pending = false;
-		vcpu->nitro.waiting_for_continue = false;
-		if (enabled)
-			reinit_completion(&vcpu->nitro.continue_completion);
+		nitro_reset_event_ring(vcpu);
 		kvm_arch_vcpu_nitro_set_syscall_trap(vcpu, enabled);
-		mutex_unlock(&vcpu->nitro.lock);
 
-		if (!enabled) {
+		if (!enabled)
 			up(&vcpu->nitro.event_sem);
-			complete_all(&vcpu->nitro.continue_completion);
-		}
 	}
+
+	if (enabled)
+		WRITE_ONCE(kvm->nitro.traps, READ_ONCE(kvm->nitro.traps) | NITRO_TRAP_SYSCALL);
 
 	return 0;
 }
 
 int nitro_ioctl_get_event(struct kvm_vcpu *vcpu, struct event *event)
 {
+	unsigned long flags;
 	int r;
 
 	memset(event, 0, sizeof(*event));
@@ -192,30 +197,23 @@ int nitro_ioctl_get_event(struct kvm_vcpu *vcpu, struct event *event)
 	if (r)
 		return r;
 
-	mutex_lock(&vcpu->nitro.lock);
-	if (vcpu->nitro.event.present)
-		*event = vcpu->nitro.event;
-	else if (vcpu->nitro.destroyed)
+	spin_lock_irqsave(&vcpu->nitro.event_lock, flags);
+	if (vcpu->nitro.event_head != vcpu->nitro.event_tail) {
+		*event = vcpu->nitro.events[vcpu->nitro.event_tail];
+		vcpu->nitro.event_tail =
+			(vcpu->nitro.event_tail + 1) % NITRO_EVENT_RING_SIZE;
+	} else if (vcpu->nitro.destroyed) {
 		r = -ENODEV;
-	else
+	} else {
 		r = -EAGAIN;
-	mutex_unlock(&vcpu->nitro.lock);
+	}
+	spin_unlock_irqrestore(&vcpu->nitro.event_lock, flags);
 
 	return r;
 }
 
 int nitro_ioctl_continue(struct kvm_vcpu *vcpu)
 {
-	mutex_lock(&vcpu->nitro.lock);
-	if (!vcpu->nitro.waiting_for_continue) {
-		mutex_unlock(&vcpu->nitro.lock);
-		return -EAGAIN;
-	}
-
-	vcpu->nitro.waiting_for_continue = false;
-	mutex_unlock(&vcpu->nitro.lock);
-
-	complete(&vcpu->nitro.continue_completion);
 	return 0;
 }
 
@@ -228,19 +226,10 @@ static int nitro_ioctl_get_regs(struct kvm_vcpu *vcpu, void __user *argp)
 	if (!regs)
 		return -ENOMEM;
 
-	mutex_lock(&vcpu->nitro.lock);
-	if (vcpu->nitro.event.present) {
-		*regs = vcpu->nitro.event.regs;
-		r = 0;
-	} else {
-		mutex_unlock(&vcpu->nitro.lock);
-		if (vcpu->kvm->mm != current->mm)
-			r = -EAGAIN;
-		else
-			r = kvm_arch_vcpu_ioctl_get_regs(vcpu, regs);
-		mutex_lock(&vcpu->nitro.lock);
-	}
-	mutex_unlock(&vcpu->nitro.lock);
+	if (vcpu->kvm->mm != current->mm)
+		r = -EAGAIN;
+	else
+		r = kvm_arch_vcpu_ioctl_get_regs(vcpu, regs);
 
 	if (!r && copy_to_user(argp, regs, sizeof(*regs)))
 		r = -EFAULT;
@@ -258,20 +247,10 @@ static int nitro_ioctl_set_regs(struct kvm_vcpu *vcpu, void __user *argp)
 	if (IS_ERR(regs))
 		return PTR_ERR(regs);
 
-	mutex_lock(&vcpu->nitro.lock);
-	if (vcpu->nitro.event.present) {
-		vcpu->nitro.event.regs = *regs;
-		vcpu->nitro.regs_dirty = true;
-		r = 0;
-	} else {
-		mutex_unlock(&vcpu->nitro.lock);
-		if (vcpu->kvm->mm != current->mm)
-			r = -EAGAIN;
-		else
-			r = kvm_arch_vcpu_ioctl_set_regs(vcpu, regs);
-		mutex_lock(&vcpu->nitro.lock);
-	}
-	mutex_unlock(&vcpu->nitro.lock);
+	if (vcpu->kvm->mm != current->mm)
+		r = -EAGAIN;
+	else
+		r = kvm_arch_vcpu_ioctl_set_regs(vcpu, regs);
 
 	kfree(regs);
 	return r;
@@ -286,19 +265,10 @@ static int nitro_ioctl_get_sregs(struct kvm_vcpu *vcpu, void __user *argp)
 	if (!sregs)
 		return -ENOMEM;
 
-	mutex_lock(&vcpu->nitro.lock);
-	if (vcpu->nitro.event.present) {
-		*sregs = vcpu->nitro.event.sregs;
-		r = 0;
-	} else {
-		mutex_unlock(&vcpu->nitro.lock);
-		if (vcpu->kvm->mm != current->mm)
-			r = -EAGAIN;
-		else
-			r = kvm_arch_vcpu_ioctl_get_sregs(vcpu, sregs);
-		mutex_lock(&vcpu->nitro.lock);
-	}
-	mutex_unlock(&vcpu->nitro.lock);
+	if (vcpu->kvm->mm != current->mm)
+		r = -EAGAIN;
+	else
+		r = kvm_arch_vcpu_ioctl_get_sregs(vcpu, sregs);
 
 	if (!r && copy_to_user(argp, sregs, sizeof(*sregs)))
 		r = -EFAULT;
@@ -316,20 +286,10 @@ static int nitro_ioctl_set_sregs(struct kvm_vcpu *vcpu, void __user *argp)
 	if (IS_ERR(sregs))
 		return PTR_ERR(sregs);
 
-	mutex_lock(&vcpu->nitro.lock);
-	if (vcpu->nitro.event.present) {
-		vcpu->nitro.event.sregs = *sregs;
-		vcpu->nitro.sregs_dirty = true;
-		r = 0;
-	} else {
-		mutex_unlock(&vcpu->nitro.lock);
-		if (vcpu->kvm->mm != current->mm)
-			r = -EAGAIN;
-		else
-			r = kvm_arch_vcpu_ioctl_set_sregs(vcpu, sregs);
-		mutex_lock(&vcpu->nitro.lock);
-	}
-	mutex_unlock(&vcpu->nitro.lock);
+	if (vcpu->kvm->mm != current->mm)
+		r = -EAGAIN;
+	else
+		r = kvm_arch_vcpu_ioctl_set_sregs(vcpu, sregs);
 
 	kfree(sregs);
 	return r;
@@ -382,43 +342,32 @@ static void nitro_fill_syscall_from_regs(struct event *event)
 
 static void nitro_report_event(struct kvm_vcpu *vcpu, struct event *event)
 {
-	long wait_r;
-	int r;
+	unsigned long flags;
+	bool queued = true;
+	u32 next;
 
 	if (!nitro_is_trap_set(vcpu->kvm, NITRO_TRAP_SYSCALL))
 		return;
 
-	mutex_lock(&vcpu->nitro.lock);
-	if (vcpu->nitro.destroyed) {
-		mutex_unlock(&vcpu->nitro.lock);
+	spin_lock_irqsave(&vcpu->nitro.event_lock, flags);
+	if (vcpu->nitro.destroyed || !vcpu->nitro.events) {
+		spin_unlock_irqrestore(&vcpu->nitro.event_lock, flags);
 		return;
 	}
 
-	reinit_completion(&vcpu->nitro.continue_completion);
-	vcpu->nitro.event = *event;
-	vcpu->nitro.waiting_for_continue = true;
-	mutex_unlock(&vcpu->nitro.lock);
+	next = (vcpu->nitro.event_head + 1) % NITRO_EVENT_RING_SIZE;
+	if (next == vcpu->nitro.event_tail) {
+		vcpu->nitro.events_dropped++;
+		vcpu->nitro.event_tail =
+			(vcpu->nitro.event_tail + 1) % NITRO_EVENT_RING_SIZE;
+		queued = false;
+	}
 
-	up(&vcpu->nitro.event_sem);
-	wait_r = wait_for_completion_interruptible_timeout(
-		&vcpu->nitro.continue_completion, msecs_to_jiffies(30000));
-
-	mutex_lock(&vcpu->nitro.lock);
-	r = kvm_arch_vcpu_nitro_set_event(vcpu, &vcpu->nitro.event,
-					  vcpu->nitro.regs_dirty,
-					  vcpu->nitro.sregs_dirty);
-	vcpu->nitro.event.present = 0;
-	vcpu->nitro.regs_dirty = false;
-	vcpu->nitro.sregs_dirty = false;
-	vcpu->nitro.waiting_for_continue = false;
-	mutex_unlock(&vcpu->nitro.lock);
-
-	if (r)
-		pr_warn_ratelimited("nitro: failed to apply event state on vcpu %d: %d\n",
-				    vcpu->vcpu_id, r);
-	if (!wait_r)
-		pr_info_ratelimited("nitro: timed out waiting for continue on vcpu %d\n",
-				    vcpu->vcpu_id);
+	vcpu->nitro.events[vcpu->nitro.event_head] = *event;
+	vcpu->nitro.event_head = next;
+	spin_unlock_irqrestore(&vcpu->nitro.event_lock, flags);
+	if (queued)
+		up(&vcpu->nitro.event_sem);
 }
 
 void nitro_report_syscall_enter(struct kvm_vcpu *vcpu)
@@ -432,37 +381,11 @@ void nitro_report_syscall_enter(struct kvm_vcpu *vcpu)
 	kvm_arch_vcpu_nitro_get_event(vcpu, &event);
 	nitro_fill_syscall_from_regs(&event);
 
-	mutex_lock(&vcpu->nitro.lock);
-	vcpu->nitro.pending_syscall = event;
-	vcpu->nitro.syscall_pending = true;
-	mutex_unlock(&vcpu->nitro.lock);
-
 	nitro_report_event(vcpu, &event);
 }
 EXPORT_SYMBOL_GPL(nitro_report_syscall_enter);
 
 void nitro_report_syscall_exit(struct kvm_vcpu *vcpu)
 {
-	struct event event;
-
-	if (!nitro_is_trap_set(vcpu->kvm, NITRO_TRAP_SYSCALL))
-		return;
-
-	mutex_lock(&vcpu->nitro.lock);
-	if (!vcpu->nitro.syscall_pending) {
-		mutex_unlock(&vcpu->nitro.lock);
-		return;
-	}
-	event = vcpu->nitro.pending_syscall;
-	vcpu->nitro.pending_syscall.present = 0;
-	vcpu->nitro.syscall_pending = false;
-	mutex_unlock(&vcpu->nitro.lock);
-
-	event.present = 1;
-	event.direction = EXIT;
-	kvm_arch_vcpu_nitro_get_event(vcpu, &event);
-	event.ret = (s64)event.regs.rax;
-
-	nitro_report_event(vcpu, &event);
 }
 EXPORT_SYMBOL_GPL(nitro_report_syscall_exit);

@@ -7,27 +7,26 @@
 #include <linux/mutex.h>
 #include <linux/nitro.h>
 #include <linux/semaphore.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 
 struct kvm;
 struct kvm_vcpu;
 
 #define NITRO_TRAP_SYSCALL	BIT(0)
+#define NITRO_EVENT_RING_SIZE	1024
 
 struct nitro {
 	u32 traps;
 };
 
 struct nitro_vcpu {
-	struct completion continue_completion;
 	struct semaphore event_sem;
-	struct mutex lock;
-	struct event event;
-	struct event pending_syscall;
-	bool regs_dirty;
-	bool sregs_dirty;
-	bool syscall_pending;
-	bool waiting_for_continue;
+	spinlock_t event_lock;
+	struct event *events;
+	u32 event_head;
+	u32 event_tail;
+	u64 events_dropped;
 	bool destroyed;
 };
 

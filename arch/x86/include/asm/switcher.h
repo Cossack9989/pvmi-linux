@@ -24,6 +24,7 @@
 #define SWITCH_FLAGS_SMOD			_BITULL(0)
 #define SWITCH_FLAGS_UMOD			_BITULL(1)
 #define SWITCH_FLAGS_NO_DS_CR3			_BITULL(2)
+#define SWITCH_FLAGS_NITRO_SYSCALL_TRAP		_BITULL(3)
 
 #define SWITCH_FLAGS_MOD_TOGGLE			(SWITCH_FLAGS_SMOD | SWITCH_FLAGS_UMOD)
 
@@ -31,7 +32,9 @@
  * Direct switching disabling bits are all the bits other than
  * SWITCH_FLAGS_SMOD or SWITCH_FLAGS_UMOD. Bits 8-64 are defined by the driver
  * using the switcher. Direct switching is enabled if all the disabling bits
- * are cleared.
+ * are cleared.  SWITCH_FLAGS_NITRO_SYSCALL_TRAP is directional: it forces
+ * user->supervisor syscall entries back to the hypervisor, but still allows
+ * supervisor->user direct returns.
  *
  * SWITCH_FLAGS_NO_DS_TO_SMOD: not to direct switch to smod due to any
  * disabling bit or smod bit being set.
@@ -40,7 +43,10 @@
  * disabling bit or umod bit being set.
  */
 #define SWITCH_FLAGS_NO_DS_TO_SMOD		(~SWITCH_FLAGS_UMOD)
-#define SWITCH_FLAGS_NO_DS_TO_UMOD		(~SWITCH_FLAGS_SMOD)
+#define SWITCH_FLAGS_NO_DS_TO_UMOD		(~(SWITCH_FLAGS_SMOD | \
+						   SWITCH_FLAGS_NITRO_SYSCALL_TRAP))
+#define SWITCH_FLAGS_NO_DS_TO_SMOD_NITRO	(SWITCH_FLAGS_NO_DS_TO_SMOD | \
+						 SWITCH_FLAGS_NITRO_SYSCALL_TRAP)
 
 /* Bits allowed to be set in the underlying eflags */
 #define SWITCH_ENTER_EFLAGS_ALLOWED	(X86_EFLAGS_FIXED | X86_EFLAGS_IF |\

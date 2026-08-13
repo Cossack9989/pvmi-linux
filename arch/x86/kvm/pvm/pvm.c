@@ -324,6 +324,32 @@ out:
 	return ret;
 
 emulation_error:
+	{
+		u8 insn[4];
+		struct x86_exception e;
+
+		if (!kvm_read_guest_virt(vcpu, kvm_get_linear_rip(vcpu),
+					 insn, sizeof(insn), &e)) {
+			if (insn[0] == 0xf3 && insn[1] == 0x0f &&
+			    insn[2] == 0x1e && (insn[3] == 0xfa || insn[3] == 0xfb)) {
+				kvm_rip_write(vcpu, kvm_rip_read(vcpu) + 4);
+				return 1;
+			}
+			if (insn[0] == 0x0f && insn[1] == 0x30)
+				return kvm_emulate_wrmsr(vcpu);
+			if (insn[0] == 0x0f && insn[1] == 0x32)
+				return kvm_emulate_rdmsr(vcpu);
+		}
+	}
+
+	pr_info_ratelimited("pvm non-pvm emulation error: rip=0x%lx cr0=0x%lx efer=0x%llx cs.sel=0x%x cs.l=%u cs.db=%u smod=%d exc.pending=%u halt=%u\n",
+			    kvm_rip_read(vcpu), vcpu->arch.cr0, vcpu->arch.efer,
+			    pvm->segments[VCPU_SREG_CS].selector,
+			    pvm->segments[VCPU_SREG_CS].l,
+			    pvm->segments[VCPU_SREG_CS].db,
+			    is_smod(pvm),
+			    vcpu->arch.exception.pending,
+			    vcpu->arch.halt_request);
 	vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
 	vcpu->run->internal.suberror = KVM_INTERNAL_ERROR_EMULATION;
 	vcpu->run->internal.ndata = 0;
@@ -997,6 +1023,16 @@ static int pvm_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 	return ret;
 }
 
+static void pvm_nitro_set_syscall_trap(struct kvm_vcpu *vcpu, bool enabled)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	if (enabled)
+		pvm->switch_flags |= SWITCH_FLAGS_NITRO_SYSCALL_TRAP;
+	else
+		pvm->switch_flags &= ~SWITCH_FLAGS_NITRO_SYSCALL_TRAP;
+}
+
 /*
  * Writes msr value into the appropriate "register".
  * Returns 0 on success, non-0 otherwise.
@@ -1530,9 +1566,13 @@ static int do_pvm_event(struct kvm_vcpu *vcpu, int vector,
 	 * something is broken in the hypervisor.
 	 */
 	if (unlikely(to_pvm(vcpu)->non_pvm_mode)) {
-		pr_warn_ratelimited("Inject event in non-PVM mode");
-		try_to_convert_to_pvm_mode(vcpu);
+		if (!try_to_convert_to_pvm_mode(vcpu))
+			return 0;
 	}
+
+	if (unlikely(!to_pvm(vcpu)->msr_vcpu_struct ||
+		     (to_pvm(vcpu)->switch_flags & SWITCH_FLAGS_PVCS_INVALID)))
+		return 0;
 
 	return __do_pvm_event(vcpu, !is_smod(to_pvm(vcpu)), vector, has_error_code, error_code);
 }
@@ -1594,6 +1634,9 @@ static void enable_irq_window(struct kvm_vcpu *vcpu)
 
 static int pvm_interrupt_allowed(struct kvm_vcpu *vcpu, bool for_injection)
 {
+	if (unlikely(to_pvm(vcpu)->non_pvm_mode))
+		return false;
+
 	return pvm_get_if_flag(vcpu) && !pvm_get_interrupt_shadow(vcpu);
 }
 
@@ -3115,6 +3158,7 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.check_emulate_instruction = pvm_check_emulate_instruction,
 	.disallowed_va = pvm_disallowed_va,
 	.vcpu_gpc_refresh = pvm_vcpu_gpc_refresh,
+	.nitro_set_syscall_trap = pvm_nitro_set_syscall_trap,
 };
 
 static struct kvm_x86_init_ops pvm_init_ops __initdata = {

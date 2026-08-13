@@ -12086,6 +12086,11 @@ int kvm_arch_vcpu_nitro_set_event(struct kvm_vcpu *vcpu, struct event *event,
 	return 0;
 }
 
+void kvm_arch_vcpu_nitro_set_syscall_trap(struct kvm_vcpu *vcpu, bool enabled)
+{
+	static_call_cond(kvm_x86_nitro_set_syscall_trap)(vcpu, enabled);
+}
+
 static void kvm_arch_vcpu_guestdbg_update_apicv_inhibit(struct kvm *kvm)
 {
 	bool set = false;

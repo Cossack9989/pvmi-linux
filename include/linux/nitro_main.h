@@ -53,5 +53,6 @@ void nitro_report_syscall_exit(struct kvm_vcpu *vcpu);
 void kvm_arch_vcpu_nitro_get_event(struct kvm_vcpu *vcpu, struct event *event);
 int kvm_arch_vcpu_nitro_set_event(struct kvm_vcpu *vcpu, struct event *event,
 				  bool regs_dirty, bool sregs_dirty);
+void kvm_arch_vcpu_nitro_set_syscall_trap(struct kvm_vcpu *vcpu, bool enabled);
 
 #endif /* _LINUX_NITRO_MAIN_H */

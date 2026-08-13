@@ -23,6 +23,11 @@ int __weak kvm_arch_vcpu_nitro_set_event(struct kvm_vcpu *vcpu,
 	return -EOPNOTSUPP;
 }
 
+void __weak kvm_arch_vcpu_nitro_set_syscall_trap(struct kvm_vcpu *vcpu,
+						 bool enabled)
+{
+}
+
 struct kvm *nitro_get_vm_by_creator(pid_t creator)
 {
 	struct kvm *kvm;
@@ -166,6 +171,7 @@ int nitro_ioctl_set_syscall_trap(struct kvm *kvm, bool enabled)
 		vcpu->nitro.waiting_for_continue = false;
 		if (enabled)
 			reinit_completion(&vcpu->nitro.continue_completion);
+		kvm_arch_vcpu_nitro_set_syscall_trap(vcpu, enabled);
 		mutex_unlock(&vcpu->nitro.lock);
 
 		if (!enabled) {

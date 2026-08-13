@@ -1765,6 +1765,8 @@ struct kvm_x86_ops {
 
 	void (*vcpu_gpc_refresh)(struct kvm_vcpu *vcpu);
 
+	void (*nitro_set_syscall_trap)(struct kvm_vcpu *vcpu, bool enabled);
+
 	bool (*has_wbinvd_exit)(void);
 
 	u64 (*get_l2_tsc_offset)(struct kvm_vcpu *vcpu);

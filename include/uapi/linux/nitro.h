@@ -25,12 +25,26 @@ struct event {
 	__u8 pad[3];
 	__u32 direction;
 	__u32 type;
+	__s32 pid;
+	__s32 tgid;
+	__u8 comm[16];
+	__u8 pad2[4];
 	__u64 nr;
 	__u64 args[6];
 	__s64 ret;
 	__u64 metadata[4];
 	struct kvm_regs regs;
 	struct kvm_sregs sregs;
+};
+
+struct nitro_task_tracking {
+	__u64 linked_lstar;
+	__u64 linked_pcpu_hot;
+	__u64 linked_per_cpu_offset;
+	__u64 linked_per_cpu_start;
+	__u64 task_pid_offset;
+	__u64 task_tgid_offset;
+	__u64 task_comm_offset;
 };
 
 struct nitro_vcpus {
@@ -57,5 +71,6 @@ struct nitro_vcpus {
 #define KVM_NITRO_SET_REGS		_IOW(KVMIO, 0xe8, struct kvm_regs)
 #define KVM_NITRO_GET_SREGS		_IOR(KVMIO, 0xe9, struct kvm_sregs)
 #define KVM_NITRO_SET_SREGS		_IOW(KVMIO, 0xea, struct kvm_sregs)
+#define KVM_NITRO_SET_TASK_TRACKING	_IOW(KVMIO, 0xeb, struct nitro_task_tracking)
 
 #endif /* _UAPI_LINUX_NITRO_H */

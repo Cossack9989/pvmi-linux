@@ -75,6 +75,11 @@ int main(void)
 	ENTRY(smod_gsbase);
 	ENTRY(nitro_direct_ring);
 	ENTRY(nitro_direct_next);
+	ENTRY(nitro_task_current_addr);
+	ENTRY(nitro_task_current_cache);
+	ENTRY(nitro_task_pid_cache);
+	ENTRY(nitro_task_tgid_cache);
+	ENTRY(nitro_task_comm_cache);
 	BLANK();
 #undef ENTRY
 
@@ -87,6 +92,9 @@ int main(void)
 #undef ENTRY
 
 #define ENTRY(entry) OFFSET(PVM_SYSCALL_EVENT_ ## entry, pvm_switcher_syscall_event, entry)
+	ENTRY(pid);
+	ENTRY(tgid);
+	ENTRY(comm);
 	ENTRY(nr);
 	ENTRY(args);
 	ENTRY(rip);

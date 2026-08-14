@@ -7,6 +7,7 @@
 
 #define SWITCH_EXIT_REASONS_SYSCALL		1024
 #define SWITCH_EXIT_REASONS_FAILED_VMETNRY	1025
+#define SWITCH_EXIT_REASONS_NITRO_TASK		1026
 
 /*
  * SWITCH_FLAGS control the way how the switcher code works,
@@ -69,6 +70,9 @@ struct pt_regs;
 struct pvm_vcpu_struct;
 
 struct pvm_switcher_syscall_event {
+	int pid;
+	int tgid;
+	char comm[16];
 	unsigned long nr;
 	unsigned long args[6];
 	unsigned long rip;
@@ -128,6 +132,11 @@ struct tss_extra {
 	unsigned long smod_gsbase;
 	struct pvm_switcher_syscall_ring *nitro_direct_ring;
 	unsigned long nitro_direct_next;
+	unsigned long nitro_task_current_addr;
+	unsigned long nitro_task_current_cache;
+	int nitro_task_pid_cache;
+	int nitro_task_tgid_cache;
+	char nitro_task_comm_cache[16];
 } ____cacheline_aligned;
 
 extern struct pt_regs *switcher_enter_guest(void);

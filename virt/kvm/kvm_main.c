@@ -5196,6 +5196,13 @@ static long kvm_vm_ioctl(struct file *filp,
 			return -EFAULT;
 		return nitro_ioctl_set_syscall_trap(kvm, enabled);
 	}
+	case KVM_NITRO_SET_TASK_TRACKING: {
+		struct nitro_task_tracking tracking;
+
+		if (copy_from_user(&tracking, argp, sizeof(tracking)))
+			return -EFAULT;
+		return nitro_ioctl_set_task_tracking(kvm, &tracking);
+	}
 	default:
 		if (kvm->mm != current->mm || kvm->vm_dead)
 			return -EIO;

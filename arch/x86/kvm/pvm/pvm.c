@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/entry-kvm.h>
 #include <linux/nitro_main.h>
+#include <linux/sched.h>
 
 #include <asm/gsseg.h>
 #include <asm/io_bitmap.h>
@@ -35,9 +36,14 @@ MODULE_LICENSE("GPL");
 static bool __read_mostly enable_cpuid_intercept = 0;
 module_param_named(cpuid_intercept, enable_cpuid_intercept, bool, 0444);
 
+static bool __read_mostly enable_pid_catch = true;
+module_param_named(enable_pid_catch, enable_pid_catch, bool, 0644);
+
 static bool __read_mostly is_intel;
 
 static unsigned long host_idt_base;
+
+#define NITRO_COMM_LEN 16
 
 static inline bool is_smod(struct vcpu_pvm *pvm)
 {
@@ -1031,6 +1037,163 @@ static void pvm_nitro_set_syscall_trap(struct kvm_vcpu *vcpu, bool enabled)
 		pvm->switch_flags |= SWITCH_FLAGS_NITRO_SYSCALL_TRAP;
 	else
 		pvm->switch_flags &= ~SWITCH_FLAGS_NITRO_SYSCALL_TRAP;
+}
+
+static bool pvm_nitro_pid_catch_enabled(void)
+{
+	return READ_ONCE(enable_pid_catch);
+}
+
+static bool pvm_nitro_task_tracking_ready(struct kvm_vcpu *vcpu)
+{
+	struct nitro_task_tracking *tracking = &vcpu->kvm->nitro.task_tracking;
+
+	return READ_ONCE(enable_pid_catch) &&
+	       READ_ONCE(vcpu->kvm->nitro.task_tracking_enabled) &&
+	       READ_ONCE(vcpu->kvm->nitro.runtime_lstar) &&
+	       tracking->linked_lstar && tracking->linked_pcpu_hot &&
+	       tracking->linked_per_cpu_offset && tracking->linked_per_cpu_start;
+}
+
+static int pvm_nitro_read_guest_kernel(struct kvm_vcpu *vcpu, u64 addr,
+				       void *data, unsigned int len)
+{
+	struct x86_exception exception;
+
+	return kvm_read_guest_virt(vcpu, addr, data, len, &exception);
+}
+
+static bool pvm_nitro_valid_comm(const char *comm)
+{
+	int i;
+	bool seen_nul = false;
+
+	for (i = 0; i < NITRO_COMM_LEN; i++) {
+		if (!comm[i]) {
+			seen_nul = true;
+			break;
+		}
+		if (comm[i] < 0x20 || comm[i] > 0x7e)
+			return false;
+	}
+
+	return seen_nul;
+}
+
+static void pvm_nitro_add_candidate(u64 *candidates, int *nr_candidates,
+				    u64 candidate)
+{
+	int i;
+
+	if (!candidate)
+		return;
+
+	for (i = 0; i < *nr_candidates; i++) {
+		if (candidates[i] == candidate)
+			return;
+	}
+
+	candidates[(*nr_candidates)++] = candidate;
+}
+
+static int pvm_nitro_build_current_task_candidates(struct kvm_vcpu *vcpu,
+						   u64 *candidates,
+						   int max_candidates)
+{
+	struct nitro_task_tracking *tracking = &vcpu->kvm->nitro.task_tracking;
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	u64 slide;
+	u64 per_cpu_offset;
+	u64 per_cpu_offset_addr;
+	int nr_candidates = 0;
+
+	if (!pvm_nitro_task_tracking_ready(vcpu))
+		return 0;
+
+	slide = READ_ONCE(vcpu->kvm->nitro.runtime_lstar) -
+		tracking->linked_lstar;
+
+	pvm_nitro_add_candidate(candidates, &nr_candidates,
+				tracking->linked_pcpu_hot + slide);
+	pvm_nitro_add_candidate(candidates, &nr_candidates,
+				pvm->msr_kernel_gs_base + tracking->linked_pcpu_hot);
+	pvm_nitro_add_candidate(candidates, &nr_candidates,
+				pvm->msr_kernel_gs_base + tracking->linked_pcpu_hot + slide);
+	pvm_nitro_add_candidate(candidates, &nr_candidates,
+				pvm->msr_kernel_gs_base +
+				(tracking->linked_pcpu_hot - tracking->linked_per_cpu_start));
+	pvm_nitro_add_candidate(candidates, &nr_candidates,
+				pvm->segments[VCPU_SREG_GS].base + tracking->linked_pcpu_hot);
+	pvm_nitro_add_candidate(candidates, &nr_candidates,
+				pvm->segments[VCPU_SREG_GS].base + tracking->linked_pcpu_hot + slide);
+
+	per_cpu_offset_addr = tracking->linked_per_cpu_offset +
+			      vcpu->vcpu_id * sizeof(u64);
+	if (!pvm_nitro_read_guest_kernel(vcpu, per_cpu_offset_addr,
+					 &per_cpu_offset, sizeof(per_cpu_offset))) {
+		pvm_nitro_add_candidate(candidates, &nr_candidates,
+					tracking->linked_pcpu_hot + per_cpu_offset);
+		pvm_nitro_add_candidate(candidates, &nr_candidates,
+					tracking->linked_pcpu_hot + slide + per_cpu_offset);
+	}
+
+	per_cpu_offset_addr = tracking->linked_per_cpu_offset + slide +
+			      vcpu->vcpu_id * sizeof(u64);
+	if (!pvm_nitro_read_guest_kernel(vcpu, per_cpu_offset_addr,
+					 &per_cpu_offset, sizeof(per_cpu_offset))) {
+		pvm_nitro_add_candidate(candidates, &nr_candidates,
+					tracking->linked_pcpu_hot + per_cpu_offset);
+		pvm_nitro_add_candidate(candidates, &nr_candidates,
+					tracking->linked_pcpu_hot + slide + per_cpu_offset);
+	}
+
+	return min(nr_candidates, max_candidates);
+}
+
+static int pvm_nitro_refresh_task_cache(struct kvm_vcpu *vcpu)
+{
+	struct nitro_task_tracking *tracking = &vcpu->kvm->nitro.task_tracking;
+	u64 pid_offset = tracking->task_pid_offset ?: offsetof(struct task_struct, pid);
+	u64 tgid_offset = tracking->task_tgid_offset ?: offsetof(struct task_struct, tgid);
+	u64 comm_offset = tracking->task_comm_offset ?: offsetof(struct task_struct, comm);
+	u64 candidates[12];
+	u64 current_task;
+	s32 pid, tgid;
+	char comm[NITRO_COMM_LEN];
+	int i, nr_candidates;
+
+	nr_candidates = pvm_nitro_build_current_task_candidates(vcpu,
+							       candidates,
+							       ARRAY_SIZE(candidates));
+
+	for (i = 0; i < nr_candidates; i++) {
+		if (pvm_nitro_read_guest_kernel(vcpu, candidates[i],
+						&current_task, sizeof(current_task)))
+			continue;
+		if (!current_task)
+			continue;
+
+		if (pvm_nitro_read_guest_kernel(vcpu, current_task + pid_offset,
+						&pid, sizeof(pid)) ||
+		    pvm_nitro_read_guest_kernel(vcpu, current_task + tgid_offset,
+						&tgid, sizeof(tgid)) ||
+		    pvm_nitro_read_guest_kernel(vcpu, current_task + comm_offset,
+						comm, sizeof(comm)))
+			continue;
+
+		comm[NITRO_COMM_LEN - 1] = '\0';
+		if (pid < 0 || tgid < 0 || !pvm_nitro_valid_comm(comm))
+			continue;
+
+		WRITE_ONCE(vcpu->nitro.task_current_slot, tracking->linked_pcpu_hot);
+		WRITE_ONCE(vcpu->nitro.task_current_addr, current_task);
+		WRITE_ONCE(vcpu->nitro.task_pid, pid);
+		WRITE_ONCE(vcpu->nitro.task_tgid, tgid);
+		memcpy(vcpu->nitro.task_comm, comm, sizeof(vcpu->nitro.task_comm));
+		return 0;
+	}
+
+	return -EFAULT;
 }
 
 /*
@@ -2283,6 +2446,12 @@ static int handle_exit_failed_vmentry(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+static int handle_exit_nitro_task(struct kvm_vcpu *vcpu)
+{
+	pvm_nitro_refresh_task_cache(vcpu);
+	return handle_synthetic_instruction_return_user(vcpu);
+}
+
 /*
  * The guest has exited.  See if we can fix it or if we need userspace
  * assistance.
@@ -2305,6 +2474,8 @@ static int pvm_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 		return handle_exit_external_interrupt(vcpu);
 	else if (exit_reason == PVM_FAILED_VMENTRY_VECTOR)
 		return handle_exit_failed_vmentry(vcpu);
+	else if (exit_reason == PVM_NITRO_TASK_VECTOR)
+		return handle_exit_nitro_task(vcpu);
 
 	vcpu_unimpl(vcpu, "pvm: unexpected exit reason 0x%x\n", exit_reason);
 	vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
@@ -2547,6 +2718,15 @@ static noinstr void pvm_vcpu_run_noinstr(struct kvm_vcpu *vcpu)
 	tss_ex->smod_entry = pvm->msr_lstar;
 	tss_ex->smod_gsbase = pvm->msr_kernel_gs_base;
 	tss_ex->nitro_direct_ring = vcpu->nitro.direct_ring;
+	tss_ex->nitro_task_current_addr = READ_ONCE(enable_pid_catch) ?
+		vcpu->nitro.task_current_slot : 0;
+	tss_ex->nitro_task_current_cache = vcpu->nitro.task_current_addr;
+	tss_ex->nitro_task_pid_cache = vcpu->nitro.task_pid;
+	tss_ex->nitro_task_tgid_cache = vcpu->nitro.task_tgid;
+	*(u64 *)&tss_ex->nitro_task_comm_cache[0] =
+		*(u64 *)&vcpu->nitro.task_comm[0];
+	*(u64 *)&tss_ex->nitro_task_comm_cache[8] =
+		*(u64 *)&vcpu->nitro.task_comm[8];
 
 	if (unlikely(pvm->guest_dr7 & DR7_BP_EN_MASK))
 		set_debugreg(pvm_eff_dr7(vcpu), 7);
@@ -2670,6 +2850,8 @@ static fastpath_t pvm_vcpu_run(struct kvm_vcpu *vcpu, bool force_immediate_exit)
 	if (pvm->host_debugctlmsr)
 		update_debugctlmsr(0);
 
+	nitro_refresh_task_cache(vcpu);
+
 	pvm_vcpu_run_noinstr(vcpu);
 
 	if (is_smod_before_run != is_smod(pvm)) {
@@ -2786,6 +2968,8 @@ static void pvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
 
 	// PVM resets
 	pvm->switch_flags = SWITCH_FLAGS_INIT;
+	if (READ_ONCE(vcpu->nitro.syscall_trap_enabled))
+		pvm->switch_flags |= SWITCH_FLAGS_NITRO_SYSCALL_TRAP;
 	pvm->hw_cs = __USER_CS;
 	pvm->hw_ss = __USER_DS;
 	pvm->int_shadow = 0;
@@ -3162,6 +3346,8 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.disallowed_va = pvm_disallowed_va,
 	.vcpu_gpc_refresh = pvm_vcpu_gpc_refresh,
 	.nitro_set_syscall_trap = pvm_nitro_set_syscall_trap,
+	.nitro_refresh_task_cache = pvm_nitro_refresh_task_cache,
+	.nitro_pid_catch_enabled = pvm_nitro_pid_catch_enabled,
 };
 
 static struct kvm_x86_init_ops pvm_init_ops __initdata = {

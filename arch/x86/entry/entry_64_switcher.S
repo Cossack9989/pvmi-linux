@@ -108,6 +108,14 @@
 .L_switcher_nitro_log_has_room:
 	imulq	$PVM_SYSCALL_EVENT_SIZE, %rcx, %rcx
 	leaq	PVM_SYSCALL_RING_events(%r11,%rcx), %r11
+	movl	TSS_extra(nitro_task_pid_cache), %edi
+	movl	%edi, PVM_SYSCALL_EVENT_pid(%r11)
+	movl	TSS_extra(nitro_task_tgid_cache), %edi
+	movl	%edi, PVM_SYSCALL_EVENT_tgid(%r11)
+	movq	TSS_extra(nitro_task_comm_cache), %rdi
+	movq	%rdi, PVM_SYSCALL_EVENT_comm(%r11)
+	movq	TSS_extra(nitro_task_comm_cache+8), %rdi
+	movq	%rdi, PVM_SYSCALL_EVENT_comm+8(%r11)
 	movq	%rax, PVM_SYSCALL_EVENT_nr(%r11)
 	movq	0(%rsp), %rdi
 	movq	%rdi, PVM_SYSCALL_EVENT_args(%r11)
@@ -300,6 +308,10 @@ SYM_INNER_LABEL(entry_SYSRETQ_switcher_unsafe_stack, SYM_L_GLOBAL)
 	cmpl	$((__USER_DS << 16) | __USER_CS), PVCS_user_cs(%rdi)
 	jne	.L_switcher_return_to_hypervisor
 
+	movq	TSS_extra(nitro_task_current_addr), %r11
+	testq	%r11, %r11
+	jnz	.L_switcher_return_task_to_hypervisor
+
 	/* switch smod to umod (switch_flags & cr3) */
 	xorb	$SWITCH_FLAGS_MOD_TOGGLE, TSS_extra(switch_flags)
 	movq	TSS_extra(umod_cr3), %rcx
@@ -350,6 +362,14 @@ SYM_INNER_LABEL(entry_SYSRETQ_switcher_unsafe_stack, SYM_L_GLOBAL)
 	/* RCX matches for RIP only before RCX is canonicalized, restore RCX and do IRET. */
 	movq	RIP-RIP(%rsp), %rcx
 	jmp	native_irq_return_iret
+
+.L_switcher_return_task_to_hypervisor:
+	popq	%rdi					/* saved rdi */
+	pushq	$0					/* pt_regs->orig_ax */
+	movl	$SWITCH_EXIT_REASONS_NITRO_TASK, 4(%rsp)
+
+	PUSH_AND_CLEAR_REGS
+	jmp	switcher_return_from_guest
 
 .L_switcher_return_to_hypervisor:
 	popq	%rdi					/* saved rdi */

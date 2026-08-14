@@ -12091,6 +12091,16 @@ void kvm_arch_vcpu_nitro_set_syscall_trap(struct kvm_vcpu *vcpu, bool enabled)
 	static_call_cond(kvm_x86_nitro_set_syscall_trap)(vcpu, enabled);
 }
 
+int kvm_arch_vcpu_nitro_refresh_task_cache(struct kvm_vcpu *vcpu)
+{
+	return static_call(kvm_x86_nitro_refresh_task_cache)(vcpu);
+}
+
+bool kvm_arch_nitro_pid_catch_enabled(void)
+{
+	return static_call(kvm_x86_nitro_pid_catch_enabled)();
+}
+
 static void kvm_arch_vcpu_guestdbg_update_apicv_inhibit(struct kvm *kvm)
 {
 	bool set = false;

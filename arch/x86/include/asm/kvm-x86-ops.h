@@ -97,6 +97,8 @@ KVM_X86_OP(load_mmu_pgd)
 KVM_X86_OP_OPTIONAL_RET0(disallowed_va)
 KVM_X86_OP_OPTIONAL(vcpu_gpc_refresh);
 KVM_X86_OP_OPTIONAL(nitro_set_syscall_trap)
+KVM_X86_OP_OPTIONAL_RET0(nitro_refresh_task_cache)
+KVM_X86_OP_OPTIONAL_RET0(nitro_pid_catch_enabled)
 KVM_X86_OP(has_wbinvd_exit)
 KVM_X86_OP(get_l2_tsc_offset)
 KVM_X86_OP(get_l2_tsc_multiplier)

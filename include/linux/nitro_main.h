@@ -18,6 +18,9 @@ struct kvm_vcpu;
 
 struct nitro {
 	u32 traps;
+	struct nitro_task_tracking task_tracking;
+	u64 runtime_lstar;
+	bool task_tracking_enabled;
 };
 
 struct nitro_vcpu {
@@ -28,6 +31,12 @@ struct nitro_vcpu {
 	u32 event_head;
 	u32 event_tail;
 	u64 events_dropped;
+	bool syscall_trap_enabled;
+	u64 task_current_slot;
+	u64 task_current_addr;
+	s32 task_pid;
+	s32 task_tgid;
+	char task_comm[16];
 	bool destroyed;
 };
 
@@ -42,6 +51,8 @@ void nitro_create_vcpu_hook(struct kvm_vcpu *vcpu);
 void nitro_destroy_vcpu_hook(struct kvm_vcpu *vcpu);
 
 int nitro_ioctl_set_syscall_trap(struct kvm *kvm, bool enabled);
+int nitro_ioctl_set_task_tracking(struct kvm *kvm,
+				  struct nitro_task_tracking *tracking);
 int nitro_ioctl_get_event(struct kvm_vcpu *vcpu, struct event *event);
 int nitro_ioctl_continue(struct kvm_vcpu *vcpu);
 long nitro_vcpu_ioctl(struct kvm_vcpu *vcpu, unsigned int ioctl,
@@ -51,9 +62,13 @@ bool nitro_is_trap_set(struct kvm *kvm, u32 trap);
 void nitro_report_syscall_enter(struct kvm_vcpu *vcpu);
 void nitro_report_syscall_exit(struct kvm_vcpu *vcpu);
 void nitro_report_kaslr(struct kvm_vcpu *vcpu, u64 runtime_entry, u64 source);
+void nitro_fill_task_event(struct kvm_vcpu *vcpu, struct event *event);
+void nitro_refresh_task_cache(struct kvm_vcpu *vcpu);
 void kvm_arch_vcpu_nitro_get_event(struct kvm_vcpu *vcpu, struct event *event);
 int kvm_arch_vcpu_nitro_set_event(struct kvm_vcpu *vcpu, struct event *event,
 				  bool regs_dirty, bool sregs_dirty);
 void kvm_arch_vcpu_nitro_set_syscall_trap(struct kvm_vcpu *vcpu, bool enabled);
+int kvm_arch_vcpu_nitro_refresh_task_cache(struct kvm_vcpu *vcpu);
+bool kvm_arch_nitro_pid_catch_enabled(void);
 
 #endif /* _LINUX_NITRO_MAIN_H */

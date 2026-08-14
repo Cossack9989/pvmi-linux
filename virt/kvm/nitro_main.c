@@ -6,11 +6,14 @@
 #include <linux/jiffies.h>
 #include <linux/kvm_host.h>
 #include <linux/nitro_main.h>
+#include <linux/string.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
 
 extern int create_vcpu_fd(struct kvm_vcpu *vcpu);
+
+#define NITRO_MSR_LSTAR 0xc0000082ULL
 
 void __weak kvm_arch_vcpu_nitro_get_event(struct kvm_vcpu *vcpu,
 					  struct event *event)
@@ -27,6 +30,11 @@ int __weak kvm_arch_vcpu_nitro_set_event(struct kvm_vcpu *vcpu,
 void __weak kvm_arch_vcpu_nitro_set_syscall_trap(struct kvm_vcpu *vcpu,
 						 bool enabled)
 {
+}
+
+int __weak kvm_arch_vcpu_nitro_refresh_task_cache(struct kvm_vcpu *vcpu)
+{
+	return 0;
 }
 
 struct kvm *nitro_get_vm_by_creator(pid_t creator)
@@ -49,6 +57,9 @@ struct kvm *nitro_get_vm_by_creator(pid_t creator)
 void nitro_create_vm_hook(struct kvm *kvm)
 {
 	kvm->nitro.traps = 0;
+	memset(&kvm->nitro.task_tracking, 0, sizeof(kvm->nitro.task_tracking));
+	kvm->nitro.runtime_lstar = 0;
+	kvm->nitro.task_tracking_enabled = false;
 	kvm->userspace_pid = task_pid_nr(current);
 }
 
@@ -74,6 +85,12 @@ void nitro_create_vcpu_hook(struct kvm_vcpu *vcpu)
 	vcpu->nitro.event_head = 0;
 	vcpu->nitro.event_tail = 0;
 	vcpu->nitro.events_dropped = 0;
+	vcpu->nitro.syscall_trap_enabled = false;
+	vcpu->nitro.task_current_slot = 0;
+	vcpu->nitro.task_current_addr = 0;
+	vcpu->nitro.task_pid = 0;
+	vcpu->nitro.task_tgid = 0;
+	memset(vcpu->nitro.task_comm, 0, sizeof(vcpu->nitro.task_comm));
 	vcpu->nitro.destroyed = false;
 }
 
@@ -91,6 +108,12 @@ void nitro_destroy_vcpu_hook(struct kvm_vcpu *vcpu)
 	direct_ring = vcpu->nitro.direct_ring;
 	vcpu->nitro.events = NULL;
 	vcpu->nitro.direct_ring = NULL;
+	vcpu->nitro.syscall_trap_enabled = false;
+	vcpu->nitro.task_current_slot = 0;
+	vcpu->nitro.task_current_addr = 0;
+	vcpu->nitro.task_pid = 0;
+	vcpu->nitro.task_tgid = 0;
+	memset(vcpu->nitro.task_comm, 0, sizeof(vcpu->nitro.task_comm));
 	spin_unlock_irqrestore(&vcpu->nitro.event_lock, flags);
 
 	kfree(events);
@@ -186,6 +209,7 @@ int nitro_ioctl_set_syscall_trap(struct kvm *kvm, bool enabled)
 
 	kvm_for_each_vcpu(i, vcpu, kvm) {
 		nitro_reset_event_ring(vcpu);
+		WRITE_ONCE(vcpu->nitro.syscall_trap_enabled, enabled);
 		kvm_arch_vcpu_nitro_set_syscall_trap(vcpu, enabled);
 
 		if (!enabled)
@@ -197,6 +221,53 @@ int nitro_ioctl_set_syscall_trap(struct kvm *kvm, bool enabled)
 
 	return 0;
 }
+
+int nitro_ioctl_set_task_tracking(struct kvm *kvm,
+				  struct nitro_task_tracking *tracking)
+{
+	struct kvm_vcpu *vcpu;
+	unsigned long i;
+	u64 current_slot = 0;
+
+	WRITE_ONCE(kvm->nitro.task_tracking_enabled, false);
+	if (!kvm_arch_nitro_pid_catch_enabled()) {
+		memset(&kvm->nitro.task_tracking, 0, sizeof(kvm->nitro.task_tracking));
+		goto reset_vcpus;
+	}
+
+	kvm->nitro.task_tracking = *tracking;
+	if (tracking->linked_lstar && tracking->linked_pcpu_hot &&
+	    tracking->linked_per_cpu_offset && tracking->linked_per_cpu_start)
+		WRITE_ONCE(kvm->nitro.task_tracking_enabled, true);
+	current_slot = tracking->linked_pcpu_hot;
+
+reset_vcpus:
+	kvm_for_each_vcpu(i, vcpu, kvm) {
+		WRITE_ONCE(vcpu->nitro.task_current_slot, current_slot);
+		WRITE_ONCE(vcpu->nitro.task_current_addr, 0);
+		WRITE_ONCE(vcpu->nitro.task_pid, 0);
+		WRITE_ONCE(vcpu->nitro.task_tgid, 0);
+		memset(vcpu->nitro.task_comm, 0, sizeof(vcpu->nitro.task_comm));
+	}
+
+	return 0;
+}
+
+void nitro_fill_task_event(struct kvm_vcpu *vcpu, struct event *event)
+{
+	event->pid = READ_ONCE(vcpu->nitro.task_pid);
+	event->tgid = READ_ONCE(vcpu->nitro.task_tgid);
+	memcpy(event->comm, vcpu->nitro.task_comm, sizeof(event->comm));
+}
+
+void nitro_refresh_task_cache(struct kvm_vcpu *vcpu)
+{
+	if (!READ_ONCE(vcpu->kvm->nitro.task_tracking_enabled))
+		return;
+
+	kvm_arch_vcpu_nitro_refresh_task_cache(vcpu);
+}
+EXPORT_SYMBOL_GPL(nitro_refresh_task_cache);
 
 static bool nitro_try_direct_event(struct kvm_vcpu *vcpu, struct event *event)
 {
@@ -219,6 +290,9 @@ static bool nitro_try_direct_event(struct kvm_vcpu *vcpu, struct event *event)
 	event->present = 1;
 	event->direction = ENTER;
 	event->type = SYSCALL;
+	event->pid = direct.pid;
+	event->tgid = direct.tgid;
+	memcpy(event->comm, direct.comm, sizeof(event->comm));
 	event->nr = direct.nr;
 	event->args[0] = direct.args[0];
 	event->args[1] = direct.args[1];
@@ -428,6 +502,8 @@ void nitro_report_syscall_enter(struct kvm_vcpu *vcpu)
 	event.present = 1;
 	event.direction = ENTER;
 	event.type = SYSCALL;
+	nitro_refresh_task_cache(vcpu);
+	nitro_fill_task_event(vcpu, &event);
 	kvm_arch_vcpu_nitro_get_event(vcpu, &event);
 	nitro_fill_syscall_from_regs(&event);
 
@@ -450,6 +526,8 @@ void nitro_report_kaslr(struct kvm_vcpu *vcpu, u64 runtime_entry, u64 source)
 	event.type = KASLR;
 	event.metadata[0] = runtime_entry;
 	event.metadata[1] = source;
+	if (source == NITRO_MSR_LSTAR)
+		WRITE_ONCE(vcpu->kvm->nitro.runtime_lstar, runtime_entry);
 
 	nitro_report_event(vcpu, &event);
 }

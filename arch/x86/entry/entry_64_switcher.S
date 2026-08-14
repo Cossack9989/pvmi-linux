@@ -37,6 +37,98 @@
 	IBRS_ENTER
 .endm
 
+.macro PVM_NITRO_IS_TRAP_SYSCALL nr:req label:req
+	cmpq	$49, \nr	/* bind */
+	je	\label
+	cmpq	$59, \nr	/* execve */
+	je	\label
+	cmpq	$62, \nr	/* kill */
+	je	\label
+	cmpq	$101, \nr	/* ptrace */
+	je	\label
+	cmpq	$112, \nr	/* setsid */
+	je	\label
+	cmpq	$157, \nr	/* prctl */
+	je	\label
+	cmpq	$165, \nr	/* mount */
+	je	\label
+.endm
+
+.macro PVM_NITRO_IS_LOG_SYSCALL nr:req label:req
+	cmpq	$1, \nr		/* write */
+	je	\label
+	cmpq	$2, \nr		/* open */
+	je	\label
+	cmpq	$10, \nr	/* mprotect */
+	je	\label
+	cmpq	$35, \nr	/* nanosleep */
+	je	\label
+	cmpq	$42, \nr	/* connect */
+	je	\label
+	cmpq	$43, \nr	/* accept */
+	je	\label
+	cmpq	$60, \nr	/* exit */
+	je	\label
+	cmpq	$82, \nr	/* rename */
+	je	\label
+	cmpq	$86, \nr	/* link */
+	je	\label
+	cmpq	$90, \nr	/* chmod */
+	je	\label
+	cmpq	$200, \nr	/* tkill */
+	je	\label
+	cmpq	$231, \nr	/* exit_group */
+	je	\label
+.endm
+
+.macro PVM_NITRO_LOG_SYSCALL
+	/*
+	 * Save the user syscall entry register state into the current vCPU's
+	 * compact direct-log ring.  Keep this path strictly leaf-only: no C
+	 * calls, no locks, no guest-controlled pointers.
+	 */
+	movq	TSS_extra(nitro_direct_ring), %r11
+	testq	%r11, %r11
+	jz	.L_switcher_nitro_log_done
+
+	movl	PVM_SYSCALL_RING_head(%r11), %ecx
+	movq	%rcx, TSS_extra(nitro_direct_next)
+	incl	TSS_extra(nitro_direct_next)
+	andl	$(PVM_SWITCHER_SYSCALL_RING_SIZE - 1), TSS_extra(nitro_direct_next)
+	movl	TSS_extra(nitro_direct_next), %edi
+	cmpl	PVM_SYSCALL_RING_tail(%r11), %edi
+	jne	.L_switcher_nitro_log_has_room
+
+	incq	PVM_SYSCALL_RING_dropped(%r11)
+	movl	PVM_SYSCALL_RING_tail(%r11), %edi
+	incl	%edi
+	andl	$(PVM_SWITCHER_SYSCALL_RING_SIZE - 1), %edi
+	movl	%edi, PVM_SYSCALL_RING_tail(%r11)
+
+.L_switcher_nitro_log_has_room:
+	imulq	$PVM_SYSCALL_EVENT_SIZE, %rcx, %rcx
+	leaq	PVM_SYSCALL_RING_events(%r11,%rcx), %r11
+	movq	%rax, PVM_SYSCALL_EVENT_nr(%r11)
+	movq	0(%rsp), %rdi
+	movq	%rdi, PVM_SYSCALL_EVENT_args(%r11)
+	movq	%rsi, PVM_SYSCALL_EVENT_args+8(%r11)
+	movq	%rdx, PVM_SYSCALL_EVENT_args+16(%r11)
+	movq	ORIG_RAX(%rsp), %rdi
+	movq	%rdi, PVM_SYSCALL_EVENT_args+24(%r11)
+	movq	%r8, PVM_SYSCALL_EVENT_args+32(%r11)
+	movq	%r9, PVM_SYSCALL_EVENT_args+40(%r11)
+	movq	8(%rsp), %rdi
+	movq	%rdi, PVM_SYSCALL_EVENT_rip(%r11)
+	movq	TSS_extra(nitro_direct_ring), %r11
+	movl	TSS_extra(nitro_direct_next), %edi
+	movl	%edi, PVM_SYSCALL_RING_head(%r11)
+
+.L_switcher_nitro_log_done:
+	movq	TSS_extra(pvcs), %rdi
+	movq	PVCS_rcx(%rdi), %rcx
+	movq	PVCS_r11(%rdi), %r11
+.endm
+
 /*
  * switcher_enter_guest - Do a transition to guest mode
  *
@@ -147,6 +239,15 @@ SYM_INNER_LABEL(entry_SYSCALL_64_switcher_safe_stack, SYM_L_GLOBAL)
 	movq	%rcx, PVCS_rip(%rdi)
 	movq	%rcx, PVCS_rcx(%rdi)
 	movq	%r11, PVCS_r11(%rdi)
+
+	testq	$SWITCH_FLAGS_NITRO_SYSCALL_TRAP, TSS_extra(switch_flags)
+	jz	.L_switcher_after_nitro_log
+	PVM_NITRO_IS_TRAP_SYSCALL %rax, .L_switcher_check_return_umod_instruction
+	PVM_NITRO_IS_LOG_SYSCALL %rax, .L_switcher_nitro_log_syscall
+	jmp	.L_switcher_after_nitro_log
+.L_switcher_nitro_log_syscall:
+	PVM_NITRO_LOG_SYSCALL
+.L_switcher_after_nitro_log:
 
 	/* switch umod to smod (switch_flags & cr3) */
 	xorb	$SWITCH_FLAGS_MOD_TOGGLE, TSS_extra(switch_flags)

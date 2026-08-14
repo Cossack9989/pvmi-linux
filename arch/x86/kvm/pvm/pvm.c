@@ -2546,6 +2546,7 @@ static noinstr void pvm_vcpu_run_noinstr(struct kvm_vcpu *vcpu)
 	tss_ex->retu_rip = pvm->msr_retu_rip_plus2;
 	tss_ex->smod_entry = pvm->msr_lstar;
 	tss_ex->smod_gsbase = pvm->msr_kernel_gs_base;
+	tss_ex->nitro_direct_ring = vcpu->nitro.direct_ring;
 
 	if (unlikely(pvm->guest_dr7 & DR7_BP_EN_MASK))
 		set_debugreg(pvm_eff_dr7(vcpu), 7);

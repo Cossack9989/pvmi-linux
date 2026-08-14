@@ -24,6 +24,7 @@ struct nitro_vcpu {
 	struct semaphore event_sem;
 	spinlock_t event_lock;
 	struct event *events;
+	struct pvm_switcher_syscall_ring *direct_ring;
 	u32 event_head;
 	u32 event_tail;
 	u64 events_dropped;

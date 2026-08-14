@@ -45,8 +45,8 @@
 #define SWITCH_FLAGS_NO_DS_TO_SMOD		(~SWITCH_FLAGS_UMOD)
 #define SWITCH_FLAGS_NO_DS_TO_UMOD		(~(SWITCH_FLAGS_SMOD | \
 						   SWITCH_FLAGS_NITRO_SYSCALL_TRAP))
-#define SWITCH_FLAGS_NO_DS_TO_SMOD_NITRO	(SWITCH_FLAGS_NO_DS_TO_SMOD | \
-						 SWITCH_FLAGS_NITRO_SYSCALL_TRAP)
+#define SWITCH_FLAGS_NO_DS_TO_SMOD_NITRO	(~(SWITCH_FLAGS_UMOD | \
+						   SWITCH_FLAGS_NITRO_SYSCALL_TRAP))
 
 /* Bits allowed to be set in the underlying eflags */
 #define SWITCH_ENTER_EFLAGS_ALLOWED	(X86_EFLAGS_FIXED | X86_EFLAGS_IF |\
@@ -60,11 +60,26 @@
 /* Bits must be set in the underlying eflags */
 #define SWITCH_ENTER_EFLAGS_FIXED	(X86_EFLAGS_FIXED | X86_EFLAGS_IF)
 
+#define PVM_SWITCHER_SYSCALL_RING_SIZE	1024
+
 #ifndef __ASSEMBLY__
 #include <linux/cache.h>
 
 struct pt_regs;
 struct pvm_vcpu_struct;
+
+struct pvm_switcher_syscall_event {
+	unsigned long nr;
+	unsigned long args[6];
+	unsigned long rip;
+};
+
+struct pvm_switcher_syscall_ring {
+	unsigned int head;
+	unsigned int tail;
+	unsigned long dropped;
+	struct pvm_switcher_syscall_event events[PVM_SWITCHER_SYSCALL_RING_SIZE];
+};
 
 /*
  * Extra per CPU control structure lives in the struct tss_struct.
@@ -111,6 +126,8 @@ struct tss_extra {
 	unsigned long retu_rip;
 	unsigned long smod_entry;
 	unsigned long smod_gsbase;
+	struct pvm_switcher_syscall_ring *nitro_direct_ring;
+	unsigned long nitro_direct_next;
 } ____cacheline_aligned;
 
 extern struct pt_regs *switcher_enter_guest(void);

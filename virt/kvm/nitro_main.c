@@ -69,6 +69,8 @@ void nitro_create_vcpu_hook(struct kvm_vcpu *vcpu)
 	vcpu->nitro.events = kcalloc(NITRO_EVENT_RING_SIZE,
 				     sizeof(*vcpu->nitro.events),
 				     GFP_KERNEL_ACCOUNT);
+	vcpu->nitro.direct_ring = kzalloc(sizeof(*vcpu->nitro.direct_ring),
+					  GFP_KERNEL_ACCOUNT);
 	vcpu->nitro.event_head = 0;
 	vcpu->nitro.event_tail = 0;
 	vcpu->nitro.events_dropped = 0;
@@ -77,6 +79,7 @@ void nitro_create_vcpu_hook(struct kvm_vcpu *vcpu)
 
 void nitro_destroy_vcpu_hook(struct kvm_vcpu *vcpu)
 {
+	struct pvm_switcher_syscall_ring *direct_ring;
 	struct event *events;
 	unsigned long flags;
 
@@ -85,10 +88,13 @@ void nitro_destroy_vcpu_hook(struct kvm_vcpu *vcpu)
 	vcpu->nitro.event_head = 0;
 	vcpu->nitro.event_tail = 0;
 	events = vcpu->nitro.events;
+	direct_ring = vcpu->nitro.direct_ring;
 	vcpu->nitro.events = NULL;
+	vcpu->nitro.direct_ring = NULL;
 	spin_unlock_irqrestore(&vcpu->nitro.event_lock, flags);
 
 	kfree(events);
+	kfree(direct_ring);
 	up(&vcpu->nitro.event_sem);
 }
 
@@ -159,6 +165,11 @@ static void nitro_reset_event_ring(struct kvm_vcpu *vcpu)
 	spin_lock_irqsave(&vcpu->nitro.event_lock, flags);
 	vcpu->nitro.event_head = 0;
 	vcpu->nitro.event_tail = 0;
+	if (vcpu->nitro.direct_ring) {
+		vcpu->nitro.direct_ring->head = 0;
+		vcpu->nitro.direct_ring->tail = 0;
+		vcpu->nitro.direct_ring->dropped = 0;
+	}
 	spin_unlock_irqrestore(&vcpu->nitro.event_lock, flags);
 
 	while (!down_trylock(&vcpu->nitro.event_sem))
@@ -187,15 +198,54 @@ int nitro_ioctl_set_syscall_trap(struct kvm *kvm, bool enabled)
 	return 0;
 }
 
+static bool nitro_try_direct_event(struct kvm_vcpu *vcpu, struct event *event)
+{
+	struct pvm_switcher_syscall_ring *ring;
+	struct pvm_switcher_syscall_event direct;
+	u32 tail, head;
+
+	ring = vcpu->nitro.direct_ring;
+	if (!ring)
+		return false;
+
+	tail = READ_ONCE(ring->tail);
+	head = READ_ONCE(ring->head);
+	if (head == tail)
+		return false;
+
+	direct = ring->events[tail];
+	WRITE_ONCE(ring->tail, (tail + 1) % PVM_SWITCHER_SYSCALL_RING_SIZE);
+
+	event->present = 1;
+	event->direction = ENTER;
+	event->type = SYSCALL;
+	event->nr = direct.nr;
+	event->args[0] = direct.args[0];
+	event->args[1] = direct.args[1];
+	event->args[2] = direct.args[2];
+	event->args[3] = direct.args[3];
+	event->args[4] = direct.args[4];
+	event->args[5] = direct.args[5];
+	event->regs.rip = direct.rip;
+
+	return true;
+}
+
 int nitro_ioctl_get_event(struct kvm_vcpu *vcpu, struct event *event)
 {
 	unsigned long flags;
 	int r;
 
 	memset(event, 0, sizeof(*event));
+	if (nitro_try_direct_event(vcpu, event))
+		return 0;
+
 	r = down_timeout(&vcpu->nitro.event_sem, msecs_to_jiffies(1000));
 	if (r)
 		return r;
+
+	if (nitro_try_direct_event(vcpu, event))
+		return 0;
 
 	spin_lock_irqsave(&vcpu->nitro.event_lock, flags);
 	if (vcpu->nitro.event_head != vcpu->nitro.event_tail) {

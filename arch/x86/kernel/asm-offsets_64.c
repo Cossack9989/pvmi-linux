@@ -73,6 +73,24 @@ int main(void)
 	ENTRY(retu_rip);
 	ENTRY(smod_entry);
 	ENTRY(smod_gsbase);
+	ENTRY(nitro_direct_ring);
+	ENTRY(nitro_direct_next);
+	BLANK();
+#undef ENTRY
+
+#define ENTRY(entry) OFFSET(PVM_SYSCALL_RING_ ## entry, pvm_switcher_syscall_ring, entry)
+	ENTRY(head);
+	ENTRY(tail);
+	ENTRY(dropped);
+	ENTRY(events);
+	BLANK();
+#undef ENTRY
+
+#define ENTRY(entry) OFFSET(PVM_SYSCALL_EVENT_ ## entry, pvm_switcher_syscall_event, entry)
+	ENTRY(nr);
+	ENTRY(args);
+	ENTRY(rip);
+	DEFINE(PVM_SYSCALL_EVENT_SIZE, sizeof(struct pvm_switcher_syscall_event));
 	BLANK();
 #undef ENTRY
 

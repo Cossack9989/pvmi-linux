@@ -389,3 +389,18 @@ void nitro_report_syscall_exit(struct kvm_vcpu *vcpu)
 {
 }
 EXPORT_SYMBOL_GPL(nitro_report_syscall_exit);
+
+void nitro_report_kaslr(struct kvm_vcpu *vcpu, u64 runtime_entry, u64 source)
+{
+	struct event event;
+
+	memset(&event, 0, sizeof(event));
+	event.present = 1;
+	event.direction = ENTER;
+	event.type = KASLR;
+	event.metadata[0] = runtime_entry;
+	event.metadata[1] = source;
+
+	nitro_report_event(vcpu, &event);
+}
+EXPORT_SYMBOL_GPL(nitro_report_kaslr);

@@ -1072,6 +1072,8 @@ static int pvm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		if (is_noncanonical_address(msr_info->data, vcpu))
 			return 1;
 		pvm->msr_lstar = data;
+		if (data)
+			nitro_report_kaslr(vcpu, data, MSR_LSTAR);
 		break;
 	case MSR_SYSCALL_MASK:
 		pvm->msr_syscall_mask = data;

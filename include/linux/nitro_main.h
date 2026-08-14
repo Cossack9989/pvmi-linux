@@ -49,6 +49,7 @@ long nitro_vcpu_ioctl(struct kvm_vcpu *vcpu, unsigned int ioctl,
 bool nitro_is_trap_set(struct kvm *kvm, u32 trap);
 void nitro_report_syscall_enter(struct kvm_vcpu *vcpu);
 void nitro_report_syscall_exit(struct kvm_vcpu *vcpu);
+void nitro_report_kaslr(struct kvm_vcpu *vcpu, u64 runtime_entry, u64 source);
 void kvm_arch_vcpu_nitro_get_event(struct kvm_vcpu *vcpu, struct event *event);
 int kvm_arch_vcpu_nitro_set_event(struct kvm_vcpu *vcpu, struct event *event,
 				  bool regs_dirty, bool sregs_dirty);

@@ -17,6 +17,7 @@ enum syscall_direction {
 enum syscall_type {
 	SYSENTER,
 	SYSCALL,
+	KASLR,
 };
 
 struct event {
@@ -27,6 +28,7 @@ struct event {
 	__u64 nr;
 	__u64 args[6];
 	__s64 ret;
+	__u64 metadata[4];
 	struct kvm_regs regs;
 	struct kvm_sregs sregs;
 };
@@ -40,6 +42,7 @@ struct nitro_vcpus {
 #define KVM_NITRO_EVENT_ERROR			1
 #define KVM_NITRO_EVENT_SYSCALL			2
 #define KVM_NITRO_EVENT_SYSRET			3
+#define KVM_NITRO_EVENT_KASLR			4
 
 #define KVM_NITRO_NUM_VMS		_IO(KVMIO, 0xe0)
 #define KVM_NITRO_ATTACH_VM		_IOW(KVMIO, 0xe1, __kernel_pid_t)
